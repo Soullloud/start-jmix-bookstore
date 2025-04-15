@@ -1,0 +1,113 @@
+#!/bin/bash
+
+set -e 
+
+if [ "${BASH_VERSINFO[0]}" -lt 5 ] || ([ "${BASH_VERSINFO[0]}" -eq 5 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]); then
+    echo "Требуется bash версии 5.2 или выше"
+    exit 1
+fi
+
+if ! command -v yc &> /dev/null; then
+    echo "Yandex Cloud CLI (yc) не установлен"
+    exit 1
+fi
+
+PROJECT_NAME="bookstore"
+NETWORK_NAME="${PROJECT_NAME}-network"
+SUBNET_NAME="${PROJECT_NAME}-subnet"
+VM_NAME="${PROJECT_NAME}-vm"
+ZONE="ru-central1-a"
+SUBNET_RANGE="192.168.0.0/24"
+
+SSH_KEY_PATH="$HOME/.ssh/yc_${PROJECT_NAME}"
+if [ ! -f "$SSH_KEY_PATH" ]; then
+    echo "Генерация SSH ключей..."
+    ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -C "yc-${PROJECT_NAME}"
+fi
+SSH_PUBLIC_KEY=$(cat "${SSH_KEY_PATH}.pub")
+
+echo "Проверка существования сети '$NETWORK_NAME'..."
+NETWORK_ID=$(yc vpc network get --name "$NETWORK_NAME" --format json 2>/dev/null | jq -r .id || true)
+
+if [ -z "$NETWORK_ID" ]; then
+    echo "Создание облачной сети '$NETWORK_NAME'..."
+    NETWORK_ID=$(yc vpc network create \
+        --name "$NETWORK_NAME" \
+        --description "Сеть для $PROJECT_NAME" \
+        --format json | jq -r .id)
+fi
+echo "Сеть '$NETWORK_NAME' готова, ID: $NETWORK_ID"
+
+echo "Проверка существования подсети '$SUBNET_NAME'..."
+SUBNET_ID=$(yc vpc subnet get --name "$SUBNET_NAME" --format json 2>/dev/null | jq -r .id || true)
+
+if [ -z "$SUBNET_ID" ]; then
+    echo "Создание облачной подсети '$SUBNET_NAME'..."
+    SUBNET_ID=$(yc vpc subnet create \
+        --name "$SUBNET_NAME" \
+        --zone "$ZONE" \
+        --network-id "$NETWORK_ID" \
+        --range "$SUBNET_RANGE" \
+        --format json | jq -r .id)
+fi
+echo "Подсеть '$SUBNET_NAME' готова, ID: $SUBNET_ID"
+
+cat > /tmp/cloud-init.yaml << EOF
+users:
+  - name: ipiris
+    groups: sudo
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - $SSH_PUBLIC_KEY
+package_update: true
+package_upgrade: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+
+runcmd:
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io
+  - systemctl start docker
+  - systemctl enable docker
+  - docker run -d -p 80:8080 jmix/jmix-bookstore
+EOF
+
+# Проверка существования ВМ
+VM_ID=$(yc compute instance get --name "$VM_NAME" --format json 2>/dev/null | jq -r .id || true)
+
+if [ -z "$VM_ID" ]; then
+    echo "Создание виртуальной машины '$VM_NAME'..."
+    VM_ID=$(yc compute instance create \
+        --name "$VM_NAME" \
+        --zone "$ZONE" \
+        --network-interface "subnet-id=$SUBNET_ID,nat-ip-version=ipv4" \
+        --create-boot-disk "type=network-ssd,size=20,image-folder-id=standard-images,image-family=ubuntu-2204-lts" \
+        --platform "standard-v3" \
+        --cores 2 \
+        --memory 4G \
+        --metadata-from-file user-data=/tmp/cloud-init.yaml \
+        --format json | jq -r '.id')
+    echo "Виртуальная машина создана, ID: $VM_ID"
+else
+    echo "Виртуальная машина '$VM_NAME' уже существует, ID: $VM_ID"
+fi
+
+echo "Получение IP-адреса виртуальной машины..."
+VM_IP=$(yc compute instance get --id "$VM_ID" --format json | jq -r '.network_interfaces[0].primary_v4_address.one_to_one_nat.address')
+echo "Ожидание запуска виртуальной машины и приложения..."
+sleep 60  
+
+echo ""
+echo "===== ИНФОРМАЦИЯ ДЛЯ ПОДКЛЮЧЕНИЯ ====="
+echo "SSH подключение: ssh -i $SSH_KEY_PATH ipiris@$VM_IP"
+echo "Веб-приложение: http://$VM_IP"
+echo "===================================="
+
+rm /tmp/cloud-init.yaml
